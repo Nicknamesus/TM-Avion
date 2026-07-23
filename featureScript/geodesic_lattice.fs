@@ -75,6 +75,31 @@ precondition // input parameters
     // base for lattice
     const familyA = makeFamily(context, id, "A",  definition.angle, center, xDir, nDir, reach, height, cs, tw);
     const familyB = makeFamily(context, id, "B", -definition.angle, center, xDir, nDir, reach, height, cs, tw);
+
+    opBoolean(context, id + "merge", {
+            "targets" : familyA,
+            "tools"   : familyB,
+            "operationType" : BooleanOperationType.UNION,
+            "targetsAndToolsNeedGrouping" : true
+    });
+    const lattice = qUnion([familyA, familyB]); // once again just for ease of use
+
+    const lbox = evBox3d(context, { "topology" : lattice, "tight" : false });
+    const pad  = vector(1, 1, 1) * definition.cellSize;
+    fCuboid(context, id + "bbox", {
+        "corner1" : lbox.minCorner - pad,
+        "corner2" : lbox.maxCorner + pad
+    });
+    opBoolean(context, id + "neg", { //substracts the wing from the box
+        "targets" : qCreatedBy(id + "bbox", EntityType.BODY),
+        "tools"   : dup(context, id + "wingNeg", definition.wing),
+        "operationType" : BooleanOperationType.SUBTRACTION
+    });
+    opBoolean(context, id + "trim", { // trims the lattice to the wing shape (lattice - (box - wing))
+        "targets" : lattice,
+        "tools"   : qCreatedBy(id + "bbox", EntityType.BODY),
+        "operationType" : BooleanOperationType.SUBTRACTION
+    });
 });
 
 function makeFamily(context is Context, id is Id, tag is string, ang is ValueWithUnits,
@@ -115,4 +140,17 @@ function makeFamily(context is Context, id is Id, tag is string, ang is ValueWit
         return qUnion([qCreatedBy(sid, EntityType.BODY), qCreatedBy(id + ("pat" ~ tag), EntityType.BODY)]); // returns a single list 
     }
     return qCreatedBy(sid, EntityType.BODY); // fallback if no pattern was created (count=0)
+}
+
+// Copy a body so the original survives a later consuming boolean.
+// opPattern with one identity transform is the reliable copy idiom; opTransform + makeCopy
+// on an identity transform does not register a queryable body.
+function dup(context is Context, id is Id, body is Query) returns Query
+{
+    opPattern(context, id, {
+        "entities"      : body,
+        "transforms"    : [identityTransform()],
+        "instanceNames" : ["1"]
+    });
+    return qCreatedBy(id, EntityType.BODY);
 }
