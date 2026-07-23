@@ -37,9 +37,6 @@ precondition // input parameters
 
     annotation { "Name" : "Close interior (root) end", "Default" : false }
     definition.capRoot is boolean;
-
-    annotation { "Name" : "Flip tip/root to other span side", "Default" : false }
-    definition.flipTip is boolean;
 }
 {
     // get chord plane and its axes
@@ -53,8 +50,8 @@ precondition // input parameters
     const center0 = (wingBox.minCorner + wingBox.maxCorner) / 2;
 
     const wbox   = evBox3d(context, { "topology" : definition.wing, "cSys" : coordSystem(center0, xDir, nDir), "tight" : false }); // remake box in temp coord system
-    const extX   = wbox.maxCorner[0] - wbox.minCorner[0];   // spanwise extent
-    const extY   = wbox.maxCorner[1] - wbox.minCorner[1];   // chordwise extent
+    const extX   = wbox.maxCorner[0] - wbox.minCorner[0];   
+    const extY   = wbox.maxCorner[1] - wbox.minCorner[1];   
     const extZ   = wbox.maxCorner[2] - wbox.minCorner[2];  //height
 
     const cs     = definition.cellSize;
@@ -75,6 +72,128 @@ precondition // input parameters
     // base for lattice
     const familyA = makeFamily(context, id, "A",  definition.angle, center, xDir, nDir, reach, height, cs, tw);
     const familyB = makeFamily(context, id, "B", -definition.angle, center, xDir, nDir, reach, height, cs, tw);
+
+    if (definition.lightenWebs)
+    {
+        const hb = definition.holeBorder;
+
+        // Cutters
+        const cutT = tw + 0.2 * millimeter;
+        const cutA = makeFamily(context, id, "CA",  definition.angle, center, xDir, nDir, reach, height, cs, cutT);
+        const cutB = makeFamily(context, id, "CB", -definition.angle, center, xDir, nDir, reach, height, cs, cutT);
+
+        const rotA = rotationAround(line(vector(0, 0, 0) * meter, nDir), definition.angle);
+        const uA   = normalize(rotA * (xDir * meter));
+        const vA   = cross(nDir, uA);
+        const rotB = rotationAround(line(vector(0, 0, 0) * meter, nDir), -definition.angle);
+        const uB   = normalize(rotB * (xDir * meter));
+        const vB   = cross(nDir, uB);
+        const count = ceil(reach / cs);
+
+        const la = (tw / 2) / sin(2 * definition.angle) + hb / 2; // half the distance from the lattice center to the hole edge along the diagonal, + margin for the hole border
+        const lb = la; // same in this case, but could be different if the angle is different for the two families
+
+        const chordExt = min(extX, extY);            // extent along chordDir (the shorter in-plane axis)
+            const spanExt  = max(extX, extY);            // extent along spanDir  (the longer  in-plane axis)
+            const hiC = chordExt / 2 + cs;    // extents from center plus 1 cell
+            const hiS = spanExt  / 2 + cs;
+            var crossings = [];
+            for (var k = -count; k <= count; k += 1) // for each A slab
+            {
+                const pA = center + vA * (k * cs); // finds the center of the A slab (center + offset direction* slab number*slab spacing)
+                for (var j = -count; j <= count; j += 1) // for each A slab
+                {
+                    const pB = center + vB * (j * cs); // finds the center of the B slab (center + offset direction* slab number*slab spacing)
+                    const t  = lineCrossT(pA, uA, pB, uB, xDir, yDir); // finds the intersection
+                    if (abs(t) <= reach) // checks if it's the slab or the vector that intersects
+                    {
+                        const crossing = pA + uA * t; // finds the intersection point
+                        const cx = dot(crossing - center, chordDir);
+                        const cy = dot(crossing - center, spanDir);
+                        if (abs(cx) <= hiC && abs(cy) <= hiS) // checks if intersection is in the wing
+                        {
+                            crossings = append(crossings,
+                                columnMidpoint(context, definition.wing, crossing, nDir, extZ / 2 + cs)); // finds collumn midpoint
+                        }
+                    }
+                }
+            }
+            var hasKeep = size(crossings) > 0;
+            var pillarKeep = qUnion([]);
+            if (hasKeep)
+            {
+                const reachN = height / 2 + cs;
+                //   la is passed for the curve radius too (3rd slot) -- the rounding stays proportional
+                //   to the waist, same as before.
+                const seed = makeHourglassPrism(context, id + "keepSeed", crossings[0],
+                                                uA, uB, vA, vB, nDir, la, lb, la, reachN, reachN);
+                var xforms = [];
+                var names  = [];
+                for (var i = 1; i < size(crossings); i += 1)
+                {
+                    xforms = append(xforms, transform(identityMatrix(3), crossings[i] - crossings[0]));
+                    names  = append(names, "k" ~ toString(i));
+                }
+                if (size(xforms) > 0)
+                {
+                    opPattern(context, id + "keepPat", {
+                        "entities" : seed,
+                        "transforms" : xforms,
+                        "instanceNames" : names
+                    });
+                    pillarKeep = qUnion([seed, qCreatedBy(id + "keepPat", EntityType.BODY)]);
+                }
+            }
+
+            // make protective shells around the lattice to keep the holes from cutting into the wing surface
+            const hbN = [nDir * hb, -(nDir * hb),
+                         normalize(chordDir + nDir) * hb, normalize(chordDir - nDir) * hb,
+                         normalize(-chordDir + nDir) * hb, normalize(-chordDir - nDir) * hb];
+            var shellLayers = [];
+            for (var i = 0; i < size(hbN); i += 1)
+            {
+                const lyr = dup(context, id + ("hShell" ~ toString(i)), definition.wing);
+                const cz  = dup(context, id + ("hCut"   ~ toString(i)), definition.wing);
+                opTransform(context, id + ("hCutXf" ~ toString(i)), {
+                    "bodies" : cz, "transform" : transform(identityMatrix(3), hbN[i])
+                });
+                opBoolean(context, id + ("hLayer" ~ toString(i)), {
+                    "targets" : lyr, "tools" : cz, "operationType" : BooleanOperationType.SUBTRACTION
+                });
+                shellLayers = append(shellLayers, lyr);
+            }
+            //merge the shell layers into two halves, then union them together to make a single shell
+            const hbHalf = floor(size(shellLayers) / 2);
+            var hbFirst = [];
+            var hbSecond = [];
+            for (var i = 0; i < size(shellLayers); i += 1)
+            {
+                if (i < hbHalf) { hbFirst = append(hbFirst, shellLayers[i]); }
+                else { hbSecond = append(hbSecond, shellLayers[i]); }
+            }
+            opBoolean(context, id + "hShellU", {
+                "targets" : qUnion(hbFirst),
+                "tools"   : qUnion(hbSecond),
+                "operationType" : BooleanOperationType.UNION,
+                "targetsAndToolsNeedGrouping" : true
+            });
+            const shellU = qUnion(shellLayers);
+
+            var confineTools = shellU;
+            if (hasKeep) { confineTools = qUnion([shellU, pillarKeep]); }
+
+            opBoolean(context, id + "confine", { // trims the web
+                "targets" : qUnion([cutA, cutB]), "tools" : confineTools,
+                "operationType" : BooleanOperationType.SUBTRACTION
+            });
+            // lattice cuts
+            opBoolean(context, id + "punchA", { 
+                "targets" : familyA, "tools" : cutA, "operationType" : BooleanOperationType.SUBTRACTION
+            });
+            opBoolean(context, id + "punchB", {
+                "targets" : familyB, "tools" : cutB, "operationType" : BooleanOperationType.SUBTRACTION
+            });
+    }
 
     opBoolean(context, id + "merge", {
             "targets" : familyA,
@@ -219,6 +338,162 @@ function makeSpanCap(context is Context, id is Id, wing is Query, center is Vect
         "operationType" : BooleanOperationType.SUBTRACTION
     });
     return qCreatedBy(capId, EntityType.BODY);
+}
+
+function lineCrossT(p1 is Vector, d1 is Vector, p2 is Vector, d2 is Vector,
+                    xDir is Vector, yDir is Vector) returns ValueWithUnits
+{
+    // find x, y coords of the two points and two direction vectors
+    const p1x = dot(p1, xDir); const p1y = dot(p1, yDir);
+    const p2x = dot(p2, xDir); const p2y = dot(p2, yDir);
+    const d1x = dot(d1, xDir); const d1y = dot(d1, yDir);
+    const d2x = dot(d2, xDir); const d2y = dot(d2, yDir);
+
+    // solve for t in the equation p1 + d1 * t = p2 + d2 * s, where s is a parameter for the second line
+    const denom = d1x * d2y - d1y * d2x;
+    return ((p2x - p1x) * d2y - (p2y - p1y) * d2x) / denom;
+}
+
+// cut everything from a plane
+function makeHalfSpaceCutter(context is Context, id is Id, planePoint is Vector,
+                             outDir is Vector, nDir is Vector,
+                             big is ValueWithUnits, height is ValueWithUnits) returns Query
+{
+    const cId = id + "c";
+    fCuboid(context, cId, {
+        "corner1" : vector(0 * meter, -big, -height / 2),
+        "corner2" : vector(big,        big,  height / 2)
+    });
+    opTransform(context, id + "cXf", {
+        "bodies" : qCreatedBy(cId, EntityType.BODY),
+        "transform" : toWorld(coordSystem(planePoint, outDir, nDir))
+    });
+    return qCreatedBy(cId, EntityType.BODY);
+}
+
+function makeCurvedFlareCutter(context is Context, id is Id, waist is Vector,
+                               u is Vector, axisDir is Vector, v is Vector,
+                               l is ValueWithUnits, r is ValueWithUnits, big is ValueWithUnits) returns Query
+{
+    const zt   = r / sqrt(2);                  // height where the arc's slope reaches 45 deg
+    const tipU = l + r * (1 - 1 / sqrt(2));     // u-coordinate of that same tangent point
+
+    // Near piece (0 <= z <= zt): "inside the rounding cylinder" union "u > l+r" together equal
+    // exactly "u beyond the circle's left edge, out to +big" -- the same half-space trick
+    // makeHalfSpaceCutter uses for a flat boundary, just with a curved one.
+    const cylId = id + "cyl";
+    fCylinder(context, cylId, {
+        "topCenter"    : waist + u * (l + r) + v * big,
+        "bottomCenter" : waist + u * (l + r) - v * big,
+        "radius"       : r
+    });
+    const farSide = makeHalfSpaceCutter(context, id + "fs", waist + u * (l + r), u, v, big, big);
+    opBoolean(context, id + "nearU", {
+        "targets" : qCreatedBy(cylId, EntityType.BODY),
+        "tools"   : farSide,
+        "operationType" : BooleanOperationType.UNION,
+        "targetsAndToolsNeedGrouping" : true
+    });
+    const nearRaw = qUnion([qCreatedBy(cylId, EntityType.BODY), farSide]);
+    const nearCap = makeHalfSpaceCutter(context, id + "nCap", waist + axisDir * zt, axisDir, u, big, big);
+    opBoolean(context, id + "nearCut", {
+        "targets" : nearRaw, "tools" : nearCap, "operationType" : BooleanOperationType.SUBTRACTION
+    });
+
+    // Far piece (z >= zt): the same flat 45-deg plane the old, un-rounded design used everywhere,
+    // anchored at the arc's tangent point instead of the waist.
+    const dFar    = normalize(u - axisDir);
+    const farFlat = makeHalfSpaceCutter(context, id + "ff", waist + u * tipU + axisDir * zt, dFar, v, big, big);
+    const farCap  = makeHalfSpaceCutter(context, id + "fCap", waist + axisDir * zt, -axisDir, u, big, big);
+    opBoolean(context, id + "farCut", {
+        "targets" : farFlat, "tools" : farCap, "operationType" : BooleanOperationType.SUBTRACTION
+    });
+
+    // nearRaw and farFlat share the z=zt plane exactly (face contact, not overlap) -- the grouped-
+    // union idiom, same reason the hourglass halves and the slab merge need it.
+    opBoolean(context, id + "join", {
+        "targets" : nearRaw,
+        "tools"   : farFlat,
+        "operationType" : BooleanOperationType.UNION,
+        "targetsAndToolsNeedGrouping" : true
+    });
+    return qUnion([nearRaw, farFlat]);
+}
+
+function makeFrustumHalf(context is Context, id is Id, waist is Vector,
+                         uA is Vector, uB is Vector, vA is Vector, vB is Vector, axisDir is Vector,
+                         la is ValueWithUnits, lb is ValueWithUnits, r is ValueWithUnits,
+                         reach is ValueWithUnits, big is ValueWithUnits) returns Query
+{
+    const baseId = id + "base";
+    fCuboid(context, baseId, {
+        "corner1" : vector(-big, -big, -big),
+        "corner2" : vector( big,  big,  big)
+    });
+    opTransform(context, id + "baseXf", {
+        "bodies" : qCreatedBy(baseId, EntityType.BODY),
+        "transform" : toWorld(coordSystem(waist, uA, axisDir))
+    });
+
+    const cutA1 = makeCurvedFlareCutter(context, id + "cA1", waist,  uA, axisDir, vA, la, r, big);
+    const cutA2 = makeCurvedFlareCutter(context, id + "cA2", waist, -uA, axisDir, vA, la, r, big);
+    const cutB1 = makeCurvedFlareCutter(context, id + "cB1", waist,  uB, axisDir, vB, lb, r, big);
+    const cutB2 = makeCurvedFlareCutter(context, id + "cB2", waist, -uB, axisDir, vB, lb, r, big);
+    const cutZ0 = makeHalfSpaceCutter(context, id + "cZ0", waist,                  -axisDir, uA, big, big);
+    const cutZ1 = makeHalfSpaceCutter(context, id + "cZ1", waist + axisDir * reach, axisDir, uA, big, big);
+
+    opBoolean(context, id + "carve", {
+        "targets" : qCreatedBy(baseId, EntityType.BODY),
+        "tools"   : qUnion([cutA1, cutA2, cutB1, cutB2, cutZ0, cutZ1]),
+        "operationType" : BooleanOperationType.SUBTRACTION
+    });
+
+    const axisPt  = waist + axisDir * (reach / 2); // center point
+    const central = qContainsPoint(qCreatedBy(baseId, EntityType.BODY), axisPt); // part containing center point
+    const slivers = qSubtraction(qCreatedBy(baseId, EntityType.BODY), central); // delete everything else
+    if (size(evaluateQuery(context, slivers)) > 0) // make sure
+    {
+        opDeleteBodies(context, id + "trimCorners", { "entities" : slivers });
+    }
+    return qCreatedBy(baseId, EntityType.BODY);
+}
+
+function makeHourglassPrism(context is Context, id is Id, waist is Vector,
+                            uA is Vector, uB is Vector, vA is Vector, vB is Vector, nDir is Vector,
+                            la is ValueWithUnits, lb is ValueWithUnits, r is ValueWithUnits,
+                            topReach is ValueWithUnits, bottomReach is ValueWithUnits) returns Query
+{
+    const big = 4 * (la + lb + topReach + bottomReach); // big number to make sure cutter works
+    const upper = makeFrustumHalf(context, id + "U", waist, uA, uB, vA, vB,  nDir, la, lb, r, topReach,    big);
+    const lower = makeFrustumHalf(context, id + "D", waist, uA, uB, vA, vB, -nDir, la, lb, r, bottomReach, big);
+
+    opBoolean(context, id + "hgU", {
+        "targets" : upper,
+        "tools"   : lower,
+        "operationType" : BooleanOperationType.UNION,
+        "targetsAndToolsNeedGrouping" : true
+    });
+    return qUnion([upper, lower]);
+}
+
+function columnMidpoint(context is Context, wing is Query, samplePoint is Vector,
+                        nDir is Vector, reachAlongN is ValueWithUnits) returns Vector
+{
+    const hits = evRaycast(context, {
+        "entities" : wing,
+        "ray"      : line(samplePoint - nDir * reachAlongN, nDir) // from below the wing, along the normal
+    });
+    if (size(hits) < 2)
+    {
+        return samplePoint;
+    }
+    const p0 = hits[0].intersection;
+    const p1 = hits[size(hits) - 1].intersection;
+    if (p0 == undefined || p1 == undefined)
+    {
+        return samplePoint;
+    }
+    return (p0 + p1) / 2;
 }
 
 // Copy a body so the original survives a later consuming boolean.
