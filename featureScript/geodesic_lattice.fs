@@ -100,6 +100,59 @@ precondition // input parameters
         "tools"   : qCreatedBy(id + "bbox", EntityType.BODY),
         "operationType" : BooleanOperationType.SUBTRACTION
     });
+
+
+    const t = definition.skinThickness;
+    const nudges = [chordDir * t, -(chordDir * t), nDir * t, -(nDir * t)];
+    var layers = [];
+    for (var i = 0; i < size(nudges); i += 1)
+    {
+        const layer = dup(context, id + ("skin" ~ toString(i)), definition.wing);
+        const cut   = dup(context, id + ("cut" ~ toString(i)), definition.wing);
+        opTransform(context, id + ("cutXf" ~ toString(i)), {
+            "bodies" : cut,
+            "transform" : transform(identityMatrix(3), nudges[i])
+        });
+        opBoolean(context, id + ("layer" ~ toString(i)), {
+            "targets" : layer,
+            "tools"   : cut,
+            "operationType" : BooleanOperationType.SUBTRACTION
+        });
+        layers = append(layers, layer);
+    }
+
+    if (definition.capTip || definition.capRoot)
+    {
+        const wtight = evBox3d(context, { "topology" : definition.wing,
+                                            "cSys" : coordSystem(center, xDir, nDir), "tight" : true });
+        var tipPlane = wtight.maxCorner[spanIdx] - t;
+        var tipKeep  = 1;
+        var rootPlane = wtight.minCorner[spanIdx] + t;
+        var rootKeep  = -1;
+        if (definition.capTip)
+        {
+            layers = append(layers, makeSpanCap(context, id + "tipCap", definition.wing, center,
+                                                chordDir, spanDir, nDir, tipPlane, tipKeep, reach, height));
+        }
+        if (definition.capRoot)
+        {
+            layers = append(layers, makeSpanCap(context, id + "rootCap", definition.wing, center,
+                                                chordDir, spanDir, nDir, rootPlane, rootKeep, reach, height));
+        }
+    }
+
+    opBoolean(context, id + "join", {
+        "targets" : lattice,
+        "tools"   : qUnion(layers),
+        "operationType" : BooleanOperationType.UNION,
+        "targetsAndToolsNeedGrouping" : true
+    });
+
+    // optionally drop the input wing
+    if (!definition.keepWing)
+    {
+        opDeleteBodies(context, id + "delWing", { "entities" : definition.wing });
+    }
 });
 
 function makeFamily(context is Context, id is Id, tag is string, ang is ValueWithUnits,
@@ -140,6 +193,32 @@ function makeFamily(context is Context, id is Id, tag is string, ang is ValueWit
         return qUnion([qCreatedBy(sid, EntityType.BODY), qCreatedBy(id + ("pat" ~ tag), EntityType.BODY)]); // returns a single list 
     }
     return qCreatedBy(sid, EntityType.BODY); // fallback if no pattern was created (count=0)
+}
+function makeSpanCap(context is Context, id is Id, wing is Query, center is Vector,
+                     chordDir is Vector, spanDir is Vector, nDir is Vector,
+                     planeSpan is ValueWithUnits, keepDir is number,
+                     reach is ValueWithUnits, height is ValueWithUnits) returns Query
+{
+    const capId = id + "cap";
+    dup(context, capId, wing);                             // wing copy to carve the cap from
+    //   Removal block: local x->chord, y->span, z->thickness. Symmetric +/-reach along span and offset
+    //   inboard by keepDir*reach, so its near face lands exactly on the cut plane and it extends 2*reach
+    //   toward the interior. Oversized in chord/thickness so it spans the whole section.
+    const cutBoxId = id + "capBox";
+    fCuboid(context, cutBoxId, {
+        "corner1" : vector(-reach, -reach, -height),
+        "corner2" : vector( reach,  reach,  height)
+    });
+    opTransform(context, id + "capBoxXf", {
+        "bodies" : qCreatedBy(cutBoxId, EntityType.BODY),
+        "transform" : toWorld(coordSystem(center + spanDir * (planeSpan - keepDir * reach), chordDir, nDir))
+    });
+    opBoolean(context, id + "capCut", {
+        "targets" : qCreatedBy(capId, EntityType.BODY),
+        "tools"   : qCreatedBy(cutBoxId, EntityType.BODY),
+        "operationType" : BooleanOperationType.SUBTRACTION
+    });
+    return qCreatedBy(capId, EntityType.BODY);
 }
 
 // Copy a body so the original survives a later consuming boolean.
